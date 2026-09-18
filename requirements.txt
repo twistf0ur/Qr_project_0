@@ -1,0 +1,6 @@
+Pillow
+opencv-python
+pyzbar
+numpy
+ttkbootstrap
+pyinstaller
