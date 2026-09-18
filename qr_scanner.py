@@ -14,6 +14,7 @@ ScanCalc shell is layered on top of it:
 """
 
 import math
+import json
 import os
 import queue
 import threading
@@ -71,6 +72,55 @@ ALL_SYMBOLS = tuple(
 )
 
 
+# Prices the user assigns to codes that are in neither CATALOG nor
+# price_overrides.json. Kept outside the module so entries survive restarts.
+PRICE_OVERRIDES = {}
+OVERRIDES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              'price_overrides.json')
+
+
+def load_price_overrides(path=OVERRIDES_PATH):
+    """Load user-assigned prices into PRICE_OVERRIDES (tolerates a bad file)."""
+    PRICE_OVERRIDES.clear()
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return
+    if isinstance(data, dict):
+        for code, entry in data.items():
+            try:
+                price = round(float(entry['price']), 2)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if price < 0:
+                continue
+            name = str(entry.get('name') or 'Custom Item {}'.format(str(code)[-4:]))
+            size = str(entry.get('size') or 'no data')
+            aisle = str(entry.get('aisle') or 'Custom')
+            PRICE_OVERRIDES[str(code)] = (name, price, size, aisle)
+
+
+def save_price_override(code, name, price, size='no data', aisle='Custom',
+                        path=OVERRIDES_PATH):
+    """Remember a user-assigned price in memory and on disk."""
+    PRICE_OVERRIDES[code] = (name, round(float(price), 2), size, aisle)
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data[code] = {'name': name, 'price': round(float(price), 2), 'size': size,
+                  'aisle': aisle}
+    try:
+        with open(path, 'w', encoding='utf-8') as handle:
+            json.dump(data, handle, indent=2)
+    except OSError:
+        pass
+
+
 def symbol_enums(names):
     """Map pyzbar symbol *names* to ZBarSymbol members (unknown names dropped).
 
@@ -109,10 +159,13 @@ def guess_product(code):
     if entry is not None:
         name, price, size, aisle = entry
         return name, price, size, aisle, False
-    # Deterministic, clearly-flagged estimate so unknown codes still tally up.
-    price = 1.99 + (sum(code.encode('utf-8')) * 7 % 900) / 100.0
+    entry = PRICE_OVERRIDES.get(code)
+    if entry is not None:
+        name, price, size, aisle = entry
+        return name, price, size, aisle, False
+    # Unknown code - no price yet, so the card prompts the user to set one.
     name = 'Unlisted Item {}'.format(code[-4:]) if len(code) >= 4 else 'Unlisted Item'
-    return name, round(price, 2), 'no data', 'Unmapped', True
+    return name, 0.0, 'no data', 'Unmapped', True
 
 
 def money(value):
@@ -723,6 +776,12 @@ class ScanCalcApp:
             active_fg=BG, font=self.fonts.d(9, 'bold'), radius=13, padx=18,
             pady=7, icon='\ue710', icon_font=self.fonts.i(11))
         self.add_button.pack(anchor=E, pady=(8, 0))
+        self.price_button = PillButton(
+            right, text='SET PRICE', command=self._prompt_price, fill=SURFACE_2,
+            fg=WARN, hover_fill=SURFACE_3, hover_fg=WARN, active_fill=WARN,
+            active_fg=BG, font=self.fonts.d(8, 'bold'), radius=13, padx=18,
+            pady=7, icon='\ue713', icon_font=self.fonts.i(11))
+        self.price_button.pack(anchor=E, pady=(8, 0))
         self._draw_tile(MUTED)
         self._set_product(None)
 
@@ -742,18 +801,115 @@ class ScanCalcApp:
             self.product_price.configure(text='$0.00', foreground=MUTED)
             self.aisle_chip.update_chip(text='NO AISLE', fill=SURFACE_3, fg=MUTED)
             self.add_button.set_state('disabled')
+            self.price_button.forget()
             self._draw_tile(MUTED)
             return
         name, price, size, aisle, estimated = product
         self.product_name.configure(text=name,
                                     foreground=WARN if estimated else FG)
-        tax_note = 'Estimate - unlisted code' if estimated else 'Tax Included'
-        self.product_meta.configure(text='{} \u2022 {}'.format(size, tax_note))
-        self.product_price.configure(text=money(price), foreground=FG)
+        if estimated:
+            self.product_meta.configure(
+                text='UNREGISTERED CODE \u2022 set a price to add it')
+            self.product_price.configure(text='NO PRICE', foreground=WARN)
+        else:
+            tax_note = 'Tax Included'
+            self.product_meta.configure(text='{} \u2022 {}'.format(size, tax_note))
+            self.product_price.configure(text=money(price), foreground=FG)
         self.aisle_chip.update_chip(text=aisle, fill=SURFACE_3,
                                     fg=WARN if estimated else ACCENT)
-        self.add_button.set_state('normal')
+        self.add_button.set_state('normal' if not estimated else 'disabled')
+        self.price_button.pack(anchor=E, pady=(8, 0))
+        if estimated:
+            self.price_button.set_state('normal')
+        else:
+            self.price_button.forget()
         self._draw_tile(WARN if estimated else ACCENT)
+
+    def _prompt_price(self):
+        """Register the pending unlisted code with a user-supplied price."""
+        code = self.pending_code
+        if code is None:
+            return
+        name, _price, _size, _aisle, estimated = guess_product(code)
+        if not estimated:             # registered already (catalogue/override)
+            self._accept_code(code, self.last_source)
+            return
+        default_name = '' if name.startswith('Unlisted Item') else name
+        dialog = tb.Toplevel(self.root, title='SET PRICE')
+        dialog.configure(background=SURFACE)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        form = tk.Frame(dialog, background=SURFACE)
+        form.pack(fill=BOTH, expand=YES, padx=18, pady=16)
+        tk.Label(form, text='UNREGISTERED CODE', background=SURFACE,
+                 foreground=MUTED, font=self.fonts.d(9, 'bold')).pack(anchor=W)
+        tk.Label(form, text=code, background=SURFACE, foreground=FG,
+                 font=self.fonts.m(11, 'bold')).pack(anchor=W, pady=(2, 12))
+
+        tk.Label(form, text='Name', background=SURFACE, foreground=MUTED,
+                 font=self.fonts.m(8)).pack(anchor=W)
+        name_entry = tb.Entry(form, bootstyle='primary', font=self.fonts.m(10))
+        name_entry.insert(0, default_name)
+        name_entry.pack(fill=X, ipady=4)
+        tk.Label(form, text='Price ($)', background=SURFACE, foreground=MUTED,
+                 font=self.fonts.m(8)).pack(anchor=W, pady=(10, 0))
+        price_entry = tb.Entry(form, bootstyle='primary', font=self.fonts.m(10))
+        price_entry.pack(fill=X, ipady=4)
+        error = tk.Label(form, text='', background=SURFACE, foreground=DANGER,
+                         font=self.fonts.m(8))
+        error.pack(anchor=W, pady=(6, 0))
+
+        buttons = tk.Frame(form, background=SURFACE)
+        buttons.pack(fill=X, pady=(12, 0))
+        result = {'value': None}
+
+        def _cancel():
+            dialog.grab_release()
+            dialog.destroy()
+
+        def _save(_event=None):
+            label = name_entry.get().strip() or 'Custom Item {}'.format(code[-4:])
+            try:
+                value = round(float(price_entry.get().strip()), 2)
+            except (TypeError, ValueError):
+                error.configure(text='Enter a number like 4.99')
+                return
+            if value <= 0 or value > 100000:
+                error.configure(text='Price must be between 0.01 and 100000')
+                return
+            result['value'] = (label, value)
+            _cancel()
+
+        PillButton(buttons, text='CANCEL', command=_cancel, fill=SURFACE_2,
+                   fg=MUTED, hover_fill=SURFACE_3, hover_fg=FG,
+                   active_fill=SURFACE_3, active_fg=FG,
+                   font=self.fonts.d(9, 'bold'), radius=12, padx=16,
+                   pady=7).pack(side='left')
+        PillButton(buttons, text='SAVE', command=_save, fill=ACCENT, fg=BG,
+                   hover_fill=ACCENT_DEEP, hover_fg=BG,
+                   active_fill=ACCENT_DEEP, active_fg=BG,
+                   font=self.fonts.d(9, 'bold'), radius=12, padx=20,
+                   pady=7).pack(side='right')
+        price_entry.bind('<Return>', _save)
+        name_entry.bind('<Return>', _save)
+        dialog.bind('<Escape>', lambda _event: _cancel())
+        dialog.update_idletasks()
+        try:
+            position = '+{}+{}'.format(self.root.winfo_rootx() + 120,
+                                       self.root.winfo_rooty() + 120)
+            dialog.geometry(position)
+        except tk.TclError:
+            pass
+        price_entry.focus_set()
+        self.root.wait_window(dialog)
+        if result['value'] is None:
+            return
+        label, value = result['value']
+        save_price_override(code, label, value)
+        name, price, size, aisle, estimated = guess_product(code)
+        self._set_product((name, price, size, aisle, estimated))
+        if self.multi_scan:
+            self._add_current()
 
     # -------------------------------------------------------- actions ------
     def _build_action_row(self, parent):
@@ -1664,6 +1820,7 @@ class Fonts:
 # ------------------------------------------------------------- launcher ----
 def main():
     """Create the root window, register the ScanCalc theme and run the app."""
+    load_price_overrides()
     root = tb.Window(title='ScanCalc - barcode / QR scanner')
     register_scancalc_theme(root.style)
     root.configure(background=BG)

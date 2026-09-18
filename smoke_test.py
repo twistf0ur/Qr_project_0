@@ -135,7 +135,19 @@ def check_helpers():
     check('catalog hit', name == 'Sparkling Water Lime' and price == 4.99
           and aisle == 'Aisle 4' and est is False)
     name, price, _size, aisle, est = q.guess_product('9999999999999')
-    check('unknown code estimates', est is True and price > 0 and aisle == 'Unmapped')
+    check('unknown code has no price until set', est is True and price == 0.0
+          and aisle == 'Unmapped', '{!r} {!r}'.format(price, aisle))
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix='.json')
+    import os as _os
+    _os.close(fd)
+    q.save_price_override('9999999999999', 'Test Item', 7.77, path=tmp)
+    q.PRICE_OVERRIDES.clear()
+    q.load_price_overrides(path=tmp)
+    name, price, _size, aisle, est = q.guess_product('9999999999999')
+    check('price override round-trips', est is False and price == 7.77
+          and name == 'Test Item', '{!r} {!r}'.format(name, price))
+    _os.remove(tmp)
     check('BATCH covers every symbol', bool(q.ALL_SYMBOLS)
           and 'QRCODE' in q.ALL_SYMBOLS and 'EAN13' in q.ALL_SYMBOLS)
 

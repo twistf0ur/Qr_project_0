@@ -20,3 +20,4 @@ Thumbs.db
 
 # App runtime data
 scanned_data.txt
+price_overrides.json
